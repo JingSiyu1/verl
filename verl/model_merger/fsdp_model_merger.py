@@ -141,6 +141,9 @@ class FSDPModelMerger(BaseModelMerger):
         # so accept it rather than refusing every veomni checkpoint on a name.
         if mesh_dim_names == ("dp_shard",):
             mesh_dim_names = ("fsdp",)
+        # FSDPTurbo names the replicated dim "dp"; same layout as ("ddp", "fsdp")
+        if mesh_dim_names == ("dp", "fsdp"):
+            mesh_dim_names = ("ddp", "fsdp")
         assert mesh_dim_names in (("fsdp",), ("ddp", "fsdp")), f"Unsupported mesh_dim_names {mesh_dim_names}"
 
         if "tp" in mesh_dim_names:
@@ -193,8 +196,13 @@ class FSDPModelMerger(BaseModelMerger):
                     state_dict[key].append(tensor._local_tensor.bfloat16())
 
                     placements = tuple(tensor.placements)
-                    # replicated placement at dp dimension can be discarded
-                    if mesh_dim_names[0] in ("dp", "ddp"):
+                    dm_shape = tuple(tensor.device_mesh.shape)
+                    if len(placements) == len(dm_shape) and len(dm_shape) > 1:
+                        # drop no-op placements on size-1 mesh dims; MoE expert params use a
+                        # 3-D (edp, efsdp, ep) mesh and reduce to a single Shard over ep here
+                        placements = tuple(p for p, size in zip(placements, dm_shape) if size > 1)
+                    elif mesh_dim_names[0] in ("dp", "ddp"):
+                        # replicated placement at dp dimension can be discarded
                         placements = placements[1:]
 
                     if key not in param_placements:
