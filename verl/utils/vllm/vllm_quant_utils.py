@@ -435,6 +435,27 @@ def process_quanted_weights_after_loading(model, reload_state):
     # layout once the staged FP8 params above have been reinstated.
     refresh_rocm_attention_weight_caches(model)
 
+def translate_weight_names_for_vllm(weights, model):
+    """Map HF-checkpoint weight names to the vLLM module tree before loading.
+
+    vLLM VLM wrappers (e.g. Qwen3.5, Qwen2.5-VL) register the language model
+    under a vLLM-side prefix (``language_model.*``) while the RL actor state
+    dict uses HF names (``model.language_model.*``). The models expose the
+    mapping via ``hf_to_vllm_mapper``; without applying it here, every weight
+    lookup in ``get_module_from_param_name``/``model.load_weights`` fails and
+    the engine silently keeps its initial (dummy) weights.
+
+    Weights mapped to ``None`` are ignored by vLLM and dropped.
+    """
+    mapper = getattr(model, "hf_to_vllm_mapper", None)
+    if mapper is None or not hasattr(mapper, "_map_name"):
+        for name, tensor in weights:
+            yield name, tensor
+        return
+    for name, tensor in weights:
+        mapped_name = mapper._map_name(name)
+        if mapped_name is not None:
+            yield mapped_name, tensor
 
 def load_quanted_weights(weights, model_runner, is_drafter=False):
     if is_drafter:
@@ -450,6 +471,7 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
     vllm_dtype = model_runner.vllm_config.model_config.dtype
 
     weights = list(weights)
+    weights = list(translate_weight_names_for_vllm(weights, model))
     weights_quantized = quant_weights(weights, model, quant_config, dtype=vllm_dtype)
 
     # Monkey patch the param class to their subclass, as certain models
