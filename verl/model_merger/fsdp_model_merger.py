@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.distributed._tensor import Placement, Shard
+from torch.distributed._tensor import Placement, Replicate, Shard
 
 try:
     # for torch 2.5+
@@ -201,9 +201,18 @@ class FSDPModelMerger(BaseModelMerger):
                         # drop no-op placements on size-1 mesh dims; MoE expert params use a
                         # 3-D (edp, efsdp, ep) mesh and reduce to a single Shard over ep here
                         placements = tuple(p for p, size in zip(placements, dm_shape) if size > 1)
-                    elif mesh_dim_names[0] in ("dp", "ddp"):
-                        # replicated placement at dp dimension can be discarded
-                        placements = placements[1:]
+                    # Only Shard placements participate in the merge. The size-1 filter
+                    # above is not enough: on a ddp>1 mesh (e.g. FSDPTurbo's ("dp", "fsdp")
+                    # with dp=2, fsdp=4) both dims have size > 1, so the leading Replicate
+                    # survives the filter and the merge would silently keep rank 0's local
+                    # shard (a 1/fsdp_size fraction of the tensor) instead of concatenating
+                    # the fsdp shards. Replicated dims never take part in concatenation, so
+                    # drop them here regardless of mesh size.
+                    placements = tuple(p for p in placements if p.is_shard())
+                    if not placements:
+                        # Fully replicated DTensor (identical local tensor on every rank):
+                        # merge like a plain replicated entry, i.e. keep one copy.
+                        placements = (Replicate(),)
 
                     if key not in param_placements:
                         param_placements[key] = placements

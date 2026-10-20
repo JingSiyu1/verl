@@ -79,6 +79,10 @@ class FP8State:
 
 fp8_state: FP8State = FP8State()
 
+# translate_weight_names_for_vllm(): the mapper-missing condition is stable per
+# process, so warn about it only once instead of on every RL refit step.
+_mapper_missing_warned: bool = False
+
 
 def is_quantized_model(vllm_config):
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
@@ -447,15 +451,40 @@ def translate_weight_names_for_vllm(weights, model):
 
     Weights mapped to ``None`` are ignored by vLLM and dropped.
     """
+    global _mapper_missing_warned
     mapper = getattr(model, "hf_to_vllm_mapper", None)
     if mapper is None or not hasattr(mapper, "_map_name"):
+        if not _mapper_missing_warned:
+            logger.warning(
+                "translate_weight_names_for_vllm: model %s exposes no hf_to_vllm_mapper; "
+                "weight names will be passed through untranslated. This is only correct "
+                "when actor and engine share identical naming.",
+                type(model).__name__,
+            )
+            _mapper_missing_warned = True
         for name, tensor in weights:
             yield name, tensor
         return
+    mapped = []
+    n_dropped = 0
+    dropped_samples = []
     for name, tensor in weights:
         mapped_name = mapper._map_name(name)
         if mapped_name is not None:
-            yield mapped_name, tensor
+            mapped.append((mapped_name, tensor))
+        else:
+            n_dropped += 1
+            if len(dropped_samples) < 5:
+                dropped_samples.append(name)
+    if n_dropped:
+        logger.warning(
+            "translate_weight_names_for_vllm: %d weight(s) mapped to None and dropped "
+            "(first: %s). Dropped weights keep the engine's initial values; unexpected "
+            "drops mean actor/checkpoint naming does not match the vLLM model tree.",
+            n_dropped,
+            dropped_samples,
+        )
+    yield from mapped
 
 def load_quanted_weights(weights, model_runner, is_drafter=False):
     if is_drafter:
