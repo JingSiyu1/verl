@@ -350,8 +350,17 @@ class vLLMColocateWorkerExtension:
         if peft_config and base_sync_done:
             logger.info("LoRA adapter sync, no post-process needed")
         elif is_quantized_model(self.model_runner.vllm_config):
-            for model, reload_state in quant_reload_states:
-                process_quanted_weights_after_loading(model, reload_state)
+            # E2 fix (20261103): RL weight sync runs this process loop inside
+            # multiproc worker RPC contexts where no VllmConfig is set.
+            # vllm-ascend w8a8_mxfp8 process hooks call get_current_vllm_config()
+            # (strict assert in vllm 0.30 core; 0.19 w8a8_mxfp8.py:389 via
+            # use_cann_megamoe) -> AssertionError. Set the engine's own config
+            # around the loop; with-exit restores the previous value.
+            from vllm.config import set_current_vllm_config
+
+            with set_current_vllm_config(self.model_runner.vllm_config):
+                for model, reload_state in quant_reload_states:
+                    process_quanted_weights_after_loading(model, reload_state)
         else:
             # Some post-load transforms are non-idempotent; run once after all buckets.
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
