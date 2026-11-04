@@ -171,6 +171,9 @@ class FSDPEngine(BaseEngine):
         self._autocast_dtype = torch.bfloat16
         self.scaler = None
 
+        # Trainer-side rollout weight quantizer, set via set_rollout_weight_quantizer.
+        self._rollout_weight_quantizer = None
+
         if self.engine_config.entropy_from_logits_with_chunking:
             entropy_from_logits = verl_F.entropy_from_logits_with_chunking
         else:
@@ -972,8 +975,19 @@ class FSDPEngine(BaseEngine):
             )
             per_tensor_param = unfuse_moe_params(per_tensor_param, self.model_config.hf_config.model_type)
 
+        if self._rollout_weight_quantizer is not None and not (peft_config is not None and base_sync_done):
+            # Skip the adapter-only LoRA stream: adapters stay in high precision.
+            refresh_scales = getattr(self._rollout_weight_quantizer, "refresh_input_global_scales", None)
+            if refresh_scales is not None:
+                refresh_scales(self.module)
+            per_tensor_param = self._rollout_weight_quantizer(per_tensor_param)
+
         peft_config_dict = peft_config.to_dict() if peft_config is not None else None
         return per_tensor_param, peft_config_dict
+
+    def set_rollout_weight_quantizer(self, quantizer) -> None:
+        """See :meth:`BaseEngine.set_rollout_weight_quantizer`."""
+        self._rollout_weight_quantizer = quantizer
 
     def _merged_lora_per_tensor_param(self):
         """Stream merged (base + LoRA) weights for rollout weight sync.
@@ -1010,7 +1024,13 @@ class FSDPEngine(BaseEngine):
         """Full HF-format weights for the checkpoint 'hf_model' export, with LoRA adapters merged."""
         if self._is_lora:
             return self._merged_lora_per_tensor_param(), None
-        return self.get_per_tensor_param()
+        quantizer, self._rollout_weight_quantizer = self._rollout_weight_quantizer, None
+        try:
+            # Checkpoints keep the high-precision master weights; only the
+            # rollout sync consumes the quantized stream.
+            return self.get_per_tensor_param()
+        finally:
+            self._rollout_weight_quantizer = quantizer
 
     def disable_adapter(self) -> ContextManager:
         return self.module.disable_adapter()
