@@ -280,6 +280,51 @@ def process_quanted_weights_after_loading(model, reload_state):
     # Last: the rebuild reads ``wo_a``, which is only back in its inference
     # layout once the staged FP8 params above have been reinstated.
     refresh_rocm_attention_weight_caches(model)
+    refresh_ascend_gdn_conv_weights(model)
+
+
+def refresh_ascend_gdn_conv_weights(model):
+    """Repack the GDN conv kernel-layout buffers after every refit.
+
+    ``load_format="dummy"`` fills every persistent tensor -- including the
+    vllm-ascend GDN derived buffer ``ascend_conv1d_weight`` -- with random
+    values. A refit rewrites the source parameters and reprocesses the
+    quantized modules listed above, but the GDN conv is an unquantized
+    layer: no refit step fires its packing hook, so the packed buffer keeps
+    the dummy values and prefill/decode consume them (gdn.py reads the
+    packed weight in every conv call). A native load stays correct only
+    because the initial model-wide processing runs the wrapped hook.
+    Refresh the pack from the already-loaded source weights here so every
+    sync wave ends with real packed conv weights.
+
+    GDN-REPACK (20261110, 调查员): opt-out with ``VERL_GDN_REPACK=0``.
+    """
+    import os as _os
+    if _os.environ.get("VERL_GDN_REPACK", "1") == "0":
+        return
+    refreshed = 0
+    for module in model.modules():
+        pack = getattr(module, "_pack_conv_weights", None)
+        if pack is None:
+            continue
+        try:
+            pack()
+            refreshed += 1
+        except Exception as e:
+            logger.warning("[GDN-REPACK] %s repack failed: %s: %s",
+                           type(module).__name__, type(e).__name__,
+                           str(e)[:160])
+    if refreshed:
+        logger.info("[GDN-REPACK] refreshed %d GDN conv packs", refreshed)
+        return
+    # Negative sentinel: packed buffers exist but no hook matched. Loud,
+    # not silent -- a vllm-ascend version mismatch must not pass quietly.
+    packed = sum(1 for _n, _p in model.named_parameters()
+                 if _n.endswith("ascend_conv1d_weight"))
+    if packed:
+        logger.warning("[GDN-REPACK] %d packed conv buffers present but no "
+                       "_pack_conv_weights hook matched -- version mismatch? "
+                       "packs NOT refreshed", packed)
 
 
 def reset_uncalibrated_kv_cache_scales(model):
