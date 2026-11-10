@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import json
-import logging
 import re
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
@@ -22,8 +21,6 @@ from typing import Any
 import torch
 
 from verl.utils.qat.compressed_tensors import _HIGH_PRECISION_DTYPES, _PACKED_EXPERTS, _unpack_experts
-
-logger = logging.getLogger(__name__)
 
 
 def detect_ascend_modelslim(model_path: str) -> bool:
@@ -57,8 +54,6 @@ class AscendMxfp8WeightQuantizer:
 
     def __init__(self, quant_description: Mapping[str, Any]):
         self.quant_description = dict(quant_description)
-        self._l0_quant = 0
-        self._l0_pass = 0
         unsupported = sorted(
             {
                 quant_type
@@ -84,18 +79,13 @@ class AscendMxfp8WeightQuantizer:
         yield name + "_scale", scale.flatten(-2, -1)[..., :groups]
 
     def __call__(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
-        self._l0_quant = 0
-        self._l0_pass = 0
-        try:
-            for name, tensor in weights:
-                packed = _PACKED_EXPERTS.match(name) if tensor.ndim == 3 else None
-                if packed:
-                    for weight_name, weight in _unpack_experts(name, tensor):
-                        yield from self._export_selected_weight(weight_name, weight)
-                else:
-                    yield from self._export_selected_weight(name, tensor)
-        finally:
-            logger.info("[L0-quant-export] quantized=%d passthrough=%d", self._l0_quant, self._l0_pass)
+        for name, tensor in weights:
+            packed = _PACKED_EXPERTS.match(name) if tensor.ndim == 3 else None
+            if packed:
+                for weight_name, weight in _unpack_experts(name, tensor):
+                    yield from self._export_selected_weight(weight_name, weight)
+            else:
+                yield from self._export_selected_weight(name, tensor)
 
     def _export_selected_weight(self, name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
         quant_type = self.quant_description.get(name)
@@ -109,8 +99,6 @@ class AscendMxfp8WeightQuantizer:
             or tensor.ndim != 2
             or tensor.dtype not in _HIGH_PRECISION_DTYPES
         ):
-            self._l0_pass += 1
             yield name, tensor
             return
-        self._l0_quant += 1
         yield from self._export_weight(name, tensor)

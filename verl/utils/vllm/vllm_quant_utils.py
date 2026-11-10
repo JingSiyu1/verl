@@ -376,7 +376,6 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
                 param.__class__ = param.orig_type
                 del param.orig_type
 
-    logger.info("[L0-load] in=%d loaded=%s", len(weights), "None" if loaded_params is None else len(loaded_params))
     return loaded_params
 
 
