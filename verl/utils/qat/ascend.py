@@ -73,10 +73,14 @@ class AscendMxfp8WeightQuantizer:
     def _export_weight(name: str, weight: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
         import torch_npu
 
-        quantized, scale = torch_npu.npu_dynamic_mx_quant(weight, axis=-1, dst_type=torch.float8_e4m3fn)
-        groups = (weight.shape[-1] + 31) // 32
+        # SCALEFIX-B (20261109): old-stack R1 chain semantics. Pre-cast to
+        # bf16 (the old stack quantized w.to(torch.bfloat16); pr8511 fed the
+        # raw dtype) and keep the operator's per-group scale grid via
+        # flatten+squeeze (R1 original) instead of the truncated slice.
+        w = weight.to(torch.bfloat16).contiguous()
+        quantized, scale = torch_npu.npu_dynamic_mx_quant(w, axis=-1, dst_type=torch.float8_e4m3fn)
         yield name, quantized
-        yield name + "_scale", scale.flatten(-2, -1)[..., :groups]
+        yield name + "_scale", scale.flatten(-2, -1).squeeze(-1)
 
     def __call__(self, weights: Iterable[tuple[str, torch.Tensor]]) -> Iterator[tuple[str, torch.Tensor]]:
         for name, tensor in weights:
